@@ -1,5 +1,8 @@
-# Input files
+# Misc Files
 *.in
+*.pdb
+*.out
+*.dcd
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

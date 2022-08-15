@@ -1,18 +1,17 @@
 import sys
 import argparse
-import matplotlib.pyplot as plt
-import numpy as np
 import MDAnalysis as mda
-from MDAnalysis.analysis import distances
+import numpy as np
 from myTools.misc import readSimpleInput
-from pickAQuote import pickAQuote
+from freud.locality import Voronoi
+# from pickAQuote import pickAQuote
 
 
 def main(infile):
     print("\nProcessing input...")
     args = readSimpleInput(infile)
 
-    required = ["top", "traj", "restypes", "frames", "out", "plot"]
+    required = ["top", "traj", "frames", "outStem", "waterName", "agent", "framesOut"]
 
     # check for a bunch of possible errors
     errors = []
@@ -21,41 +20,21 @@ def main(infile):
             vars(args)[item]
         except AttributeError:
             errors.append(f"ERROR: missing argument '{item}'")
-
-
-    if isinstance(args.restypes, str):
-        args.restypes = [args.restypes.upper()]
-    else:
-        for i in range(len(args.restypes)):
-            args.restypes[i] = args.restypes[i].upper()
-
-    if args.longitudinal is True and len(args.restypes) > 1:
-        errors.append("ERROR: Only one restype is allowed for longitudinal")
-    elif args.plot.lower()=="mean" and args.longitudinal is False:
-        errors.append("ERROR: Longitudinal is mandatory for mean curves")
         
     if errors:
         sys.exit("\n".join(errors))
 
-    output = getDistribution(**vars(args))
+    frameDictionary = getDistribution(**vars(args))
+    
+    writeFrameData(frameDictionary, **vars(args))            
 
-    with open(args.out, "w+") as o:
-        for add, dist in output.items():
-            o.write(add+":"+", ".join(list(map(str, dist)))+"\n")
-
-    if args.plot.lower()=="hist":
-        print("Plotting...")
-        plot_hist(output, **vars(args))
-    elif args.plot.lower()=="mean":
-        print("Plotting...")
-        plot_mean(output, **vars(args))
-
-    pickAQuote("./quotes.txt")
+    print("Done <3")
+    #pickAQuote("./quotes.txt")
 
 
-def getDistribution(top, traj, restypes, frames, frameStart = 0, frameStep = 1, longitudinal = False, **kwargs):
+def getDistribution(top, traj, frames, waterName, agent, frameStart = 0, frameStep = 1, **kwargs):
     """
-    Finds the distribution of additions to an MD simulation
+    Finds the distribution of additions within the first and second shells in an MD simulation
 
     Arguments
     ---------
@@ -63,22 +42,21 @@ def getDistribution(top, traj, restypes, frames, frameStart = 0, frameStep = 1, 
         the topology file
     traj: str
         the trajectory file
-    restypes: list[str]
-        the residues being examined
     frames: int or str
         total number of frames to analyze or "all"
+    waterName: str
+        the name of the water in the topology (SOL, HOH, etc.)
+    agent: str
+        the name of the addition (TMO, URE, etc.)
     frameStart: str
         the first frame to analyze
     frameStep: str
         the size of step between frames
-    longitudinal: bool
-        True if examining one restype over multiple frames, otherwise accumulate over all frames
 
-    returns
+    Returns
     -------
-    addDistances: dict[str, list]
-        distances of residues in question from nearest protein atom
-
+    agentCountFrames: dict[str : list[int]]
+        the count of the agent in question and frames with that count
     """
 
     # kill warning about unknown atom masses, useless
@@ -102,79 +80,63 @@ def getDistribution(top, traj, restypes, frames, frameStart = 0, frameStep = 1, 
         sys.exit("Invalid frame selection")
 
 
-    prot = uni.select_atoms('not resname TMO UR SOL CL', updating=True)
+    protein = uni.select_atoms(f"not resname {waterName} NA CL Na+ Na Cl Cl- TMO URE UR", updating=True)
+    proteinIdx = set(protein.ix)
+
+    others = uni.select_atoms(f"resname {waterName} NA CL Na+ Na Cl Cl- TMO URE UR", updating=True)
+    othersIdx = set(others.ix)
+    residueMap = {atom.ix : atom.residue.ix for atom in others}
+
+    agentCountFrames = {i : [] for i in range(100)}
 
     # nAtoms = {"TMO" : 14, "UR" : 8, "SOL" : 4, "CL" : 1}
+    for ts in uni.trajectory[frameStart:frameStop:frameStep]:
+        voronoiDiagram = Voronoi().compute(ts)
+        neighborList = voronoiDiagram.nlist[:]
 
-    if longitudinal:
-        res = restypes[0]
-        addDistances = {}
-        sel = uni.select_atoms(f"resname {res}", updating=True).split('residue')
+        firstAtoms = set()
         
-        for ts in uni.trajectory[frameStart:frameStop:frameStep]:
-            print(ts.frame, flush=(((ts.frame-frameStart)/frameStep)%10==0))
-            addDistances[f"{res} Frame {ts.frame}"] = []
-            for residue in sel:
-                dist_array = distances.distance_array(residue.positions, prot.positions,box=uni.dimensions)
-                addDistances[f"{res} Frame {ts.frame}"].append(np.min(dist_array))
-    else:
-        addDistances = {res : [] for res in restypes}
-        sels = {res : uni.select_atoms(f"resname {res}", updating=True).split('residue') for res in restypes}
-        for ts in uni.trajectory[frameStart:frameStop:frameStep]:
-            print(ts.frame, flush=(((ts.frame-frameStart)/frameStep)%10==0))
-            for res, sel in sels.items():
-                #for residue in sel.split('residue'):
-                for residue in sel:
-                    dist_array = distances.distance_array(residue.positions, prot.positions,box=uni.dimensions)
-                    addDistances[res].append(np.min(dist_array))
-    
-    return addDistances
 
-def plot_hist(dists, longitudinal=False, separate=True, normalize = False, figure="distributions.png", **kwargs):
-    if separate:
-        fig, axis = plt.subplots(1, len(dists.keys()), figsize=(10*len(dists.keys()), 10))
+        for i in range(len(neighborList)):
+            if neighborList[i, 0] in proteinIdx and neighborList[i, 1] in othersIdx:
+                firstAtoms.add(neighborList[i, 1])
+        firstResidues = set()
+        close = uni.select_atoms(f"byres (resname {waterName} NA CL Na Cl Na+ Cl- TMO URE UR and around 5.0 (not resname {waterName} NA CL Na Cl Na+ Cl- TMO URE UR))", periodic=True).ix
+        for ix in np.intersect1d(close, list(firstAtoms)):
+            firstResidues.add(residueMap[ix])
+        firstShellResidues = uni.residues[list(firstResidues)].resnames
+        agentCount = np.count_nonzero(firstShellResidues == agent)
+        agentCountFrames[agentCount].append(ts.frame)
 
-        for i, res in enumerate(dists.keys()):
-            axis[i].hist(dists[res], density=normalize)
-            axis[i].set_title(res)
-            axis[i].set_xlabel("Distance to nearest protein atom (" + r"$\mathrm{\AA}$" + ")")
-            if normalize:
-                axis[i].set_ylabel("Probabilty density")
-            else:
-                axis[i].set_ylabel("Count")
-    else:
-        fig, axis = plt.subplots()
-        axis.set_title(" ".join(dists.keys()) + " Combined")
-        axis.set_xlabel("Distance to nearest protein atom (" + r"$\mathrm{\AA}$" + ")")
-        if normalize:
-            axis.set_ylabel("Probabilty density")
-        else:
-            axis.set_ylabel("Count")
+    return agentCountFrames
 
-        for res in dists:
-            axis.hist(dists[res], alpha=0.3, density=normalize, label = res, bins = 30)
-        plt.legend()
+def writeFrameData(frameDictionary, framesOut, **kwargs):
+    """
+    Writes the distribution of additions to an outfile
 
-    plt.savefig(figure)
+    Arguments
+    ---------
+    frameDictionary: dict[str : list[int]]
+        the count of the agent in question and frames with that count
+    framesOut: str
+        the name of the outfile to write to
+
+    Returns
+    -------
+    None
+    """
+    count_list = []
+    with open(framesOut, "w+") as out:
+        for count in frameDictionary:
+            if frameDictionary[count]:
+                print(f"{count}:"+ ", ".join(list(map(str, frameDictionary[count]))), file=out)
+                count_list += list(map(lambda x: count, frameDictionary[count]))
+        print("Mean:", np.mean(count_list), file=out)
+        print("StDev:", np.std(count_list), file=out)
+        
 
 
-def plot_mean(dists, figure="distributions.png", **kwargs):
-    fig, axis = plt.subplots()
-    items = [(k, v) for k,v in dists.items()]
 
-    res = items[0][0].split()[0]
-    axis.set_title(f"{res} Mean Distance")
-    axis.set_xlabel("Frame")
-    axis.set_ylabel("Mean distance to nearest protein atom (" + r"$\mathrm{\AA}$" + ")")
-    
-    items = list(map(lambda pair: (int(pair[0].split()[2]), np.mean(pair[1])), items))
-    frame, mean = zip(*items)
-    # for res in dists:
-    #     axis.hist(dists[res], alpha=0.5, density=normalize, label = res, bins = 30)
-    # plt.legend()
-    axis.plot(frame, mean)
-
-    plt.savefig(figure)
 
 
 if __name__=="__main__":
